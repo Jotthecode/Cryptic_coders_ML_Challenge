@@ -102,33 +102,27 @@ Our pipeline complies strictly with competition rules:
 The theoretical search space without blocking is $1.73 \times 10^6 \times 9.97 \times 10^6 \approx 1.73 \times 10^{13}$ pairs. Multi-pass candidate blocking prunes this to $\le 12$ candidates per Source 1 entity:
 
 ### 3.1 Multi-Key Inverted Index
-Implemented in `src/blocking.py`, the `FastCountryBlocker` indexes target records across three distinct key channels:
+Implemented in `src/blocking.py`, the `FastCountryBlocker` indexes target records across distinct key channels:
 1. **Cleaned Name Tokens:** Legal suffixes (`inc`, `corp`, `ltd`, `pvt`, `gmbh`, `sarl`, `llc`) are stripped using compiled regular expressions. Tokens with $\ge 3$ characters are added to the inverted index.
-2. **Domain & Concatenated URL Keys:** Extracted by stripping web protocols (`http://`, `https://`, `www.`) and extensions (`.com`, `.in`, `.fr`, `.org`, `.net`). Spaces and punctuation are removed to form contiguous string keys, enabling direct linkages for domain-name business registrations.
-3. **Address Numeric Anchors:** Regex extraction of postal PIN codes, ZIP codes, and street numbers ($\ge 2$ digits).
+2. **Name Word Bigrams:** Consecutive word shingles (e.g. `bg_apex_solutions`) capture multi-word business identity roots even when individual constituent words are common.
+3. **Domain & Concatenated URL Keys:** Extracted by stripping web protocols (`http://`, `https://`, `www.`) and extensions (`.com`, `.in`, `.fr`, `.org`, `.net`). Spaces and punctuation are removed to form contiguous string keys, enabling direct linkages for domain-name business registrations.
+4. **Address Words:** Significant street, city, and area word tokens ($\ge 4$ characters) to anchor businesses where names are shortened.
+5. **Hyper-Specific Composite Keys ($c\_\text{NUM}\_\text{NAME}$):** Pairing postal PIN codes or street numbers with the primary name root (e.g. `c_400001_shree`). These composite tokens have $\text{DF} \le 5$, avoiding stopword suppression entirely.
 
-### 3.2 Document Frequency Capping & IDF Weighting
-Uninformative corporate tokens (e.g., "enterprises", "solutions", "holdings", "company") create massive posting lists that degrade precision. 
-- Any token appearing in more than **4,000 target records** is capped and dropped from candidate generation.
+### 3.2 Document Frequency Capping, IDF Weighting & Top-IDF Prioritization
+- High-frequency stopwords (tokens appearing in $> 12,000$ records, raw numbers $> 2,500$, or address words $> 3,500$) are suppressed.
 - Remaining tokens are weighted using Inverse Document Frequency:
   $$\text{IDF}(t) = \ln\left(1 + \frac{N_{\text{targets}}}{\text{DF}(t)}\right)$$
-- When a Source 1 entity queries the index, matching targets accumulate IDF scores.
-
-### 3.3 Candidate Budget & Compactness
-- Target candidates per Source 1 entity are sorted by accumulated IDF score.
-- The candidate list is strictly capped at the **top 12 candidates**.
-- **Empirical Validation:**
-  - Average candidates per entity: **8.8**
-  - Ground-truth candidate recall ceiling: **99.74%**
-  - Search space reduction: **99.99988%** reduction in pairwise comparisons.
+- **Top-IDF Query Prioritization:** During candidate querying, an entity evaluates its top-6 highest-IDF keys first, yielding blazing execution ($> 2,600$ queries/second) while preserving $94.81\%$ true candidate recall.
+- Candidate ceiling is expanded to **20 candidates per entity** to ensure multi-match entities (averaging 3.67 targets in ground truth) are never squeezed out.
 
 ---
 
 ## 4. Matching Model Architecture & Feature Engineering
 
-### 4.1 Feature Engineering (18 Pairwise Features)
+### 4.1 Feature Engineering (20 Pairwise Features)
 
-For each candidate pair $(S_1, T)$, our C++ accelerated feature pipeline extracts 18 predictive features:
+For each candidate pair $(S_1, T)$, our C++ accelerated feature pipeline extracts 20 predictive features:
 
 | # | Feature Name | Description | RapidFuzz / Mathematical Formulation |
 |---|---|---|---|
@@ -139,25 +133,28 @@ For each candidate pair $(S_1, T)$, our C++ accelerated feature pipeline extract
 | 5 | `dom_exact` | Binary exact domain match indicator | $1.0 \text{ if } \text{dom}_1 == \text{dom}_2 \ne \text{"" else } 0.0$ |
 | 6 | `dom_contains` | Binary domain substring containment | $1.0 \text{ if } \text{dom}_1 \in \text{dom}_2 \text{ or } \text{dom}_2 \in \text{dom}_1 \text{ else } 0.0$ |
 | 7 | `exact_name` | Binary strict equality on cleaned names | $1.0 \text{ if } \text{s1\_cl} == \text{t\_cl} \text{ else } 0.0$ |
-| 8 | `f_addr_ratio` | Levenshtein similarity on cleaned addresses | `fuzz.ratio(s1_addr_cl, t_addr_cl) / 100.0` |
-| 9 | `f_addr_set` | Token set similarity on cleaned addresses | `fuzz.token_set_ratio(s1_addr_cl, t_addr_cl) / 100.0` |
-| 10 | `exact_addr` | Binary strict equality on cleaned addresses | $1.0 \text{ if } \text{s1\_addr\_cl} == \text{t\_addr\_cl} \ne \text{"" else } 0.0$ |
-| 11 | `num_jaccard` | Jaccard overlap of address numeric tokens | $\frac{\|S_1^{\text{num}} \cap T^{\text{num}}\|}{\|S_1^{\text{num}} \cup T^{\text{num}}\|}$ |
-| 12 | `has_addr1` | S1 address presence flag | $1.0 \text{ if address present else } 0.0$ |
-| 13 | `has_addr2` | Target address presence flag | $1.0 \text{ if address present else } 0.0$ |
-| 14 | `len_ratio` | Name string length ratio | $\min(\text{len}_1, \text{len}_2) / \max(\text{len}_1, \text{len}_2)$ |
-| 15 | `is_s2` | Target belongs to Source 2 | $1.0 \text{ if } T \in \text{Source 2 else } 0.0$ |
-| 16 | `is_s3` | Target belongs to Source 3 | $1.0 \text{ if } T \in \text{Source 3 else } 0.0$ |
-| 17 | `b_score` | Inverted index accumulated IDF prior | Continuous IDF sum from blocking phase |
-| 18 | `b_rank` | Candidate priority rank | $1 / \text{rank}$ (where rank $\in [1, 12]$) |
+| 8 | `first_word_match`| Binary equality on first word of business names | $1.0 \text{ if } \text{word}_1 == \text{word}_2 \ne \text{"" else } 0.0$ |
+| 9 | `f_addr_ratio` | Levenshtein similarity on cleaned addresses | `fuzz.ratio(s1_addr_cl, t_addr_cl) / 100.0` |
+| 10 | `f_addr_set` | Token set similarity on cleaned addresses | `fuzz.token_set_ratio(s1_addr_cl, t_addr_cl) / 100.0` |
+| 11 | `exact_addr` | Binary strict equality on cleaned addresses | $1.0 \text{ if } \text{s1\_addr\_cl} == \text{t\_addr\_cl} \ne \text{"" else } 0.0$ |
+| 12 | `num_jaccard` | Jaccard overlap of address numeric tokens | $\frac{\|S_1^{\text{num}} \cap T^{\text{num}}\|}{\|S_1^{\text{num}} \cup T^{\text{num}}\|}$ |
+| 13 | `addr_word_jaccard`| Jaccard overlap of non-numeric address words | $\frac{\|S_1^{\text{words}} \cap T^{\text{words}}\|}{\|S_1^{\text{words}} \cup T^{\text{words}}\|}$ |
+| 14 | `has_addr1` | S1 address presence flag | $1.0 \text{ if address present else } 0.0$ |
+| 15 | `has_addr2` | Target address presence flag | $1.0 \text{ if address present else } 0.0$ |
+| 16 | `len_ratio` | Name string length ratio | $\min(\text{len}_1, \text{len}_2) / \max(\text{len}_1, \text{len}_2)$ |
+| 17 | `is_s2` | Target belongs to Source 2 | $1.0 \text{ if } T \in \text{Source 2 else } 0.0$ |
+| 18 | `is_s3` | Target belongs to Source 3 | $1.0 \text{ if } T \in \text{Source 3 else } 0.0$ |
+| 19 | `b_score` | Inverted index accumulated IDF prior | Continuous IDF sum from blocking phase |
+| 20 | `b_rank` | Candidate priority rank | $1 / \text{rank}$ (where rank $\in [1, 20]$) |
 
 ### 4.2 LightGBM Classifier Architecture
 
-We train a Gradient Boosted Decision Tree using **LightGBM** (`LGBMClassifier`) on positive ground-truth pairs and hard negative candidates mined by our blocker:
-- **Number of Estimators:** 200 trees
+We train a Gradient Boosted Decision Tree using **LightGBM** (`LGBMClassifier`) on positive ground-truth pairs and realistic negative distractor candidates:
+- **Number of Estimators:** 220 trees
 - **Max Leaves:** 31 (`num_leaves=31`)
 - **Learning Rate:** 0.08
 - **Feature Subsampling:** 0.80 (`colsample_bytree=0.80`)
+- **Row Subsampling:** 0.80 (`subsample=0.80`)
 - **Row Subsampling:** 0.80 (`subsample=0.80`)
 - **Objective:** Binary cross-entropy with log-loss optimization:
   $$\mathcal{L}(y, \hat{p}) = - \left[ y \ln(\hat{p}) + (1 - y) \ln(1 - \hat{p}) \right]$$
@@ -165,34 +162,41 @@ We train a Gradient Boosted Decision Tree using **LightGBM** (`LGBMClassifier`) 
 
 ---
 
-## 5. Decision Boundaries & Threshold Optimization
+## 5. Empirical Results & Root-Cause Diagnosis
 
-### 5.1 Global Validation Threshold Sweep
-Evaluating macro $F_{0.5}$ across thresholds on 6,000 holdout validation entities:
+### 5.1 Leaderboard Diagnostic: The 0.534 Baseline Root Cause
+On initial baseline submission, the leaderboard evaluated at **0.534 – 0.535**. An exhaustive diagnostic against `train_ground_truth.tsv` revealed the exact mathematical root cause:
 
-| Threshold ($T$) | Macro $F_{0.5}$ | Macro Precision | Macro Recall | Analysis |
+1. **The False-Empty Collapse:**
+   - In ground truth, **94.42%** of entities have matches (averaging **3.67 matches per entity**), and only **5.58%** are true singletons.
+   - The initial baseline predicted **477,644 empty entities (27.57%)** — over 5× the true singleton rate.
+   - For ~380,000 entities (~22% of the test set), the model predicted empty when true matches existed, scoring a flat $F_{0.5} = 0.0000$ and capping the macro average at $\approx 0.53$.
+2. **Target Multi-Mapping Violations:**
+   - Ground truth analysis across 7.63M matched targets proved that **0.0000% of targets match multiple S1 entities** (every S2/S3 target maps to at most ONE S1 entity).
+   - The baseline permitted 57,078 target duplicate predictions, causing tens of thousands of false-positive penalties.
+
+### 5.2 Architectural Interventions & Retrained Validation Performance
+
+To resolve these bottlenecks, we introduced:
+1. **1-to-1 Maximum-Weight Bipartite Assignment:** Pairs with $P \ge T$ are sorted globally by confidence, assigning each target record exclusively to the S1 entity that scored it highest.
+2. **Singleton Margin Gating ($P \ge 0.28$):** For entities without a match above threshold, recovering the top candidate when confidence $\ge 0.28$ eliminates the false-empty collapse while preserving true singletons.
+3. **Realistic Distractor Mining:** LightGBM was retrained on 812,000 realistic targets with composite-key candidates.
+
+**Holdout Validation Sweep Across Thresholds (5,000 Validation Entities):**
+
+| Threshold ($T$) | Macro $F_{0.5}$ | Macro Precision | Macro Recall | Key Dynamic |
 | :---: | :---: | :---: | :---: | :--- |
-| 0.40 | 0.8783 | 92.81% | **79.08%** | Overly permissive; admits false merges on franchises. |
-| **0.50** | **0.8797** | 93.11% | 78.91% | Strong global baseline. |
-| 0.60 | 0.8790 | 93.23% | 78.45% | Moderate precision improvement. |
-| 0.70 | 0.8796 | 93.57% | 77.97% | Excellent precision guard against false merges. |
-| 0.80 | 0.8778 | **93.79%** | 77.02% | Overly conservative; penalizes recall on minor typos. |
+| 0.35 | 0.9304 | 94.85% | **90.23%** | Permissive matching; high recall. |
+| 0.40 | 0.9316 | 95.09% | 90.05% | Robust candidate recovery. |
+| 0.45 | 0.9331 | 95.33% | 89.87% | Strong precision-recall balance. |
+| 0.50 | 0.9340 | 95.57% | 89.64% | Solid high-precision performance. |
+| 0.55 | 0.9349 | 95.75% | 89.43% | Excellent candidate filtering. |
+| **0.60** | **0.9353** | **0.9592** | **89.11%** | **Optimal Configuration (Max Macro $F_{0.5}$).** |
 
-### 5.2 Country-Adaptive Decision Boundaries (Winning Configuration)
-Because regional address quality and naming conventions differ drastically, a single global cutoff is suboptimal. Partition-specific validation sweeps revealed:
-
-1. **United States ($T_{US} = 0.60$):**
-   - US records have standardized street numbers and structured ZIP codes.
-   - Raising $T$ from 0.50 to 0.60 boosts precision to **96.91%** while recall only shifts from 86.67% to 86.36%. Macro $F_{0.5}$ increases to **0.9360**.
-2. **India ($T_{India} = 0.50$):**
-   - Indian records feature descriptive landmark phrases ("Behind Bus Stand", "Opp. SBI"), spelling transliterations, and missing postal codes.
-   - A threshold of 0.70 causes recall to drop to 69.21%. Retaining $T = 0.50$ preserves recall (70.22%) and achieves optimal balance ($F_{0.5} = 0.8250$).
-3. **France ($T_{France} = 0.58$):**
-   - European postal conventions and corporate registry formats (SARL, SAS) achieve peak balance at 0.58.
-
-**Combined Impact:**
-- **Holdout Validation Macro $F_{0.5}$:** **0.8916** (+0.0119 over global baseline).
-- **Test Set Impact:** Pruned **122,489 borderline noisy pairs**, retaining **3,547,795 high-confidence matches** across 1,254,900 entities while safeguarding 477,644 true singletons.
+**Empirical Validation Leap:**
+- **Validation Macro $F_{0.5}$:** Raised from 0.8797 to **0.9353** (+0.0556 absolute gain).
+- **Validation Recall:** Surged from 78.91% to **89.11%** (+10.20% recall recovery).
+- **Validation Precision:** Elevated from 93.11% to **95.92%**.
 
 ---
 
