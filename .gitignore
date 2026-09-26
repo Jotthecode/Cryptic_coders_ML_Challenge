@@ -6,7 +6,9 @@ __pycache__/
 # Large datasets and temporary caches
 dataset/
 tmp_cache/
+_transfer/
 *.parquet
+*.zst
 
 # Model binaries and submission archives (>100MB exceeds GitHub limits)
 models/
