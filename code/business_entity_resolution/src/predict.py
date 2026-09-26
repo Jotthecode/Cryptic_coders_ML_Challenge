@@ -105,6 +105,14 @@ def run_country_inference(
     blocker.fit_targets(target_ids, raw_names, raw_addrs)
     print(f"[{country_upper}] Composite index built in {time.time()-t0:.2f}s with {len(blocker.token_index):,} tokens.")
 
+    # Pre-normalize target records once to eliminate millions of redundant regexes
+    t0 = time.time()
+    t_cl_names = [clean_text(str(n).lower() if n else "", remove_legal=True) for n in raw_names]
+    t_ns_names = [clean_domain(str(n).lower() if n else "").replace(" ", "") for n in raw_names]
+    t_cl_addrs = [clean_address(str(a).lower() if a else "") for a in raw_addrs]
+    t_nums_list = [extract_address_numbers(str(a).lower() if a else "") for a in raw_addrs]
+    print(f"[{country_upper}] Target strings pre-normalized in {time.time()-t0:.2f}s.")
+
     total_s1 = len(s1_df)
     print(f"[{country_upper}] Scoring {total_s1:,} S1 entities in batches of {batch_size}...")
     t0 = time.time()
@@ -139,18 +147,16 @@ def run_country_inference(
 
             for tidx, b_score, b_rank in cands:
                 tid = target_ids[tidx]
-                tn = raw_names[tidx]
-                ta = raw_addrs[tidx]
 
                 feat = extract_pair_features(
                     s1_name_cl=s1_n_cl,
                     s1_name_ns=s1_n_ns,
                     s1_addr_cl=s1_a_cl,
                     s1_nums=s1_nums,
-                    t_name_cl=clean_text(tn, remove_legal=True),
-                    t_name_ns=clean_domain(tn).replace(" ", ""),
-                    t_addr_cl=clean_address(ta),
-                    t_nums=extract_address_numbers(ta) if s1_nums else set(),
+                    t_name_cl=t_cl_names[tidx],
+                    t_name_ns=t_ns_names[tidx],
+                    t_addr_cl=t_cl_addrs[tidx],
+                    t_nums=t_nums_list[tidx],
                     target_id=tid,
                     b_score=b_score,
                     b_rank=b_rank,
@@ -216,6 +222,7 @@ def run_country_inference(
 
     # Free memory before next country
     del blocker, target_ids, raw_names, raw_addrs, all_cands_map, candidate_pairs_pool
+    del t_cl_names, t_ns_names, t_cl_addrs, t_nums_list
     del s1_ids, s1_names, s1_addrs, s1_assigned_matches, assigned_targets, s1_top_candidate
     gc.collect()
 

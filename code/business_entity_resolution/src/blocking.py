@@ -164,24 +164,28 @@ class FastCountryBlocker:
                     for nt in name_toks[:2]:
                         query_keys.add(f"c_{num}_{nt[:5]}")
 
+        valid_keys = [(tok, self.token_idf[tok]) for tok in query_keys if tok in self.token_idf]
+        if not valid_keys:
+            return []
+        valid_keys.sort(key=lambda x: x[1], reverse=True)
+        top_keys = valid_keys[:6]
+
         scores = defaultdict(float)
 
-        for tok in query_keys:
-            if tok in self.token_idf:
-                w = self.token_idf[tok]
-                if tok.startswith("c_"):
-                    w *= 2.2  # hyper-specific composite key boost
-                elif tok.startswith("bg_"):
-                    w *= 1.6  # word bigram boost
-                elif tok.startswith("ns_"):
-                    w *= 2.0  # continuous domain trade name boost
-                elif tok.startswith("a_"):
-                    w *= 0.4  # moderate weight on address words
-                elif tok.startswith("num_"):
-                    w *= 0.5  # moderate weight on raw numbers
+        for tok, w in top_keys:
+            if tok.startswith("c_"):
+                w *= 2.2  # hyper-specific composite key boost
+            elif tok.startswith("bg_"):
+                w *= 1.6  # word bigram boost
+            elif tok.startswith("ns_"):
+                w *= 2.0  # continuous domain trade name boost
+            elif tok.startswith("a_"):
+                w *= 0.4  # moderate weight on address words
+            elif tok.startswith("num_"):
+                w *= 0.5  # moderate weight on raw numbers
 
-                for tidx in self.token_index[tok]:
-                    scores[tidx] += w
+            for tidx in self.token_index[tok]:
+                scores[tidx] += w
 
         if not scores:
             return []
