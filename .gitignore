@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large datasets and temporary caches
+dataset/
+tmp_cache/
+*.parquet
+
+# Model binaries and submission archives (>100MB exceeds GitHub limits)
+models/
+*.pkl
+*.zip
+
+# Large submission TSV files (candidate_pairs.tsv is 262MB, exceeding GitHub 100MB limit)
+output/*.tsv
+output_test_sample/
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
