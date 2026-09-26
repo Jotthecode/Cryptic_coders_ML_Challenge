@@ -63,3 +63,11 @@ Validate compliance with competition format rules:
 ```bash
 python utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir dataset/test
 ```
+
+### 6. (Optional) Country-Adaptive High-Precision Rescoring
+
+Dynamically fine-tune decision boundaries by region (e.g. US=0.60, India=0.50, France=0.58) to eliminate false merges while protecting recall:
+
+```bash
+python src/rescore_threshold.py --us 0.60 --india 0.50 --france 0.58 --output output/matching_results_adaptive.tsv
+```

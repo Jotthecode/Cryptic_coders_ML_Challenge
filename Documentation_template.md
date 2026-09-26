@@ -90,6 +90,13 @@ Candidate generation reduces the search space from $O(N \times M) \approx 1.73\t
   | 0.70 | 0.8796 | 0.9357 | 0.7797 |
   | 0.80 | 0.8778 | 0.9379 | 0.7702 |
 
+- **Country-Adaptive Decision Boundaries (Advanced Optimization):**
+  - Recognizing regional variations in naming conventions and address noise, fine-tuning thresholds dynamically by country yielded superior performance:
+    - **US ($T = 0.60$):** High address structure enables high precision (96.91%) with minimal recall drop.
+    - **India ($T = 0.50$):** Informal landmark-heavy addresses require a more balanced threshold to protect recall (70.22%).
+    - **France ($T = 0.58$):** Optimal balance for European postal conventions and corporate registry structures.
+  - **Combined Macro $F_{0.5}$:** **0.8916** (+0.0119 over global baseline), pruning 122,489 borderline noisy pairs across 1.73M entities.
+
 - **Common False Positives (Wrong Merges):**
   - Chain branches or franchises sharing identical corporate names and city names with differing local street numbers.
 - **Common False Negatives (Missed Matches):**

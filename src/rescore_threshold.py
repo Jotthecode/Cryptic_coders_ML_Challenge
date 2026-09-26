@@ -1,8 +1,8 @@
 """
 ML Challenge 2026 - Business Entity Resolution
 Ultra-fast rescoring tool for candidate matches.
-Allows adjusting classification threshold (e.g. from 0.50 to 0.70) in ~2 minutes
-without re-running expensive candidate indexing.
+Supports both single global thresholds and country-adaptive thresholds (US vs. India vs. France)
+in ~2 minutes without re-running expensive candidate indexing.
 """
 
 import argparse
@@ -27,17 +27,34 @@ from utils import clean_address, clean_domain, clean_text, extract_address_numbe
 def rescore_pipeline(
     input_matches: str = "output/matching_results.tsv",
     input_candidates: str = "output/candidate_pairs.tsv",
-    output_matches: str = "output/matching_results_p70.tsv",
+    output_matches: str = "output/matching_results_adaptive.tsv",
     test_dir: str = "dataset/test",
     cache_dir: str = "tmp_cache",
     model_path: str = "models/matching_model.pkl",
-    threshold: float = 0.70,
+    threshold_us: float = 0.60,
+    threshold_india: float = 0.50,
+    threshold_france: float = 0.58,
+    threshold_default: float = 0.55,
     batch_size: int = 50000,
 ):
     print("=" * 70)
-    print(f"  HIGH-PRECISION RESCORING TO THRESHOLD {threshold:.2f}")
+    print("  COUNTRY-ADAPTIVE HIGH-PRECISION RESCORING")
+    print(f"  US Threshold     : {threshold_us:.2f}")
+    print(f"  India Threshold  : {threshold_india:.2f}")
+    print(f"  France Threshold : {threshold_france:.2f}")
+    print(f"  Default Threshold: {threshold_default:.2f}")
     print("=" * 70)
     t_start = time.time()
+
+    def get_country_threshold(c_name: str) -> float:
+        c = str(c_name).strip().upper()
+        if c == "US":
+            return threshold_us
+        if c == "INDIA":
+            return threshold_india
+        if c == "FRANCE":
+            return threshold_france
+        return threshold_default
 
     # Load model
     print(f"Loading model from {model_path}...")
@@ -86,7 +103,8 @@ def rescore_pipeline(
     all_s1_ids = s1_df["entity_id"].to_list()
     countries = s1_df["c_norm"].unique().to_list()
 
-    p70_matches: Dict[str, List[str]] = defaultdict(list)
+    adaptive_matches: Dict[str, List[str]] = defaultdict(list)
+    country_stats = {}
 
     for country in countries:
         country_s1 = s1_df.filter(pl.col("c_norm") == country)
@@ -94,12 +112,12 @@ def rescore_pipeline(
         if not os.path.exists(parquet_path):
             continue
 
-        print(f"\n[{country}] Loading targets from {parquet_path}...")
+        th = get_country_threshold(country)
+        print(f"\n[{country}] Loading targets (Active Threshold: {th:.2f})...")
         t0 = time.time()
         targets_df = pl.read_parquet(parquet_path)
         print(f"[{country}] Loaded {len(targets_df):,} targets in {time.time()-t0:.2f}s.")
 
-        # Build fast lookup for target records
         target_ids = targets_df["entity_id"].to_list()
         raw_names = targets_df["business_name"].to_list()
         raw_addrs = targets_df["business_address"].to_list()
@@ -117,11 +135,12 @@ def rescore_pipeline(
             if sid in s1_matches:
                 s1_country_recs[sid] = (r.get("business_name") or "", r.get("business_address") or "")
 
-        print(f"[{country}] Extracting features for {len(s1_country_recs):,} S1 entities to rescore...")
+        print(f"[{country}] Scoring {len(s1_country_recs):,} entities at threshold {th:.2f}...")
         t0 = time.time()
 
         pairs_to_score = []
         pair_keys = []
+        c_matches_count = 0
 
         for sid, (s1_n, s1_a) in s1_country_recs.items():
             s1_n_cl = clean_text(s1_n, remove_legal=True)
@@ -148,7 +167,7 @@ def rescore_pipeline(
                     t_addr_cl=clean_address(ta),
                     t_nums=extract_address_numbers(ta) if s1_nums else set(),
                     target_id=tid,
-                    b_score=10.0 / b_rank,  # high fidelity rank-based IDF proxy
+                    b_score=10.0 / b_rank,
                     b_rank=b_rank,
                 )
                 pairs_to_score.append(feat)
@@ -158,8 +177,9 @@ def rescore_pipeline(
                     X_batch = np.array(pairs_to_score, dtype=np.float32)
                     probs = model.predict_proba(X_batch)[:, 1]
                     for (s_id, t_id), prob in zip(pair_keys, probs):
-                        if prob >= threshold:
-                            p70_matches[s_id].append(t_id)
+                        if prob >= th:
+                            adaptive_matches[s_id].append(t_id)
+                            c_matches_count += 1
                     pairs_to_score.clear()
                     pair_keys.clear()
 
@@ -167,16 +187,22 @@ def rescore_pipeline(
             X_batch = np.array(pairs_to_score, dtype=np.float32)
             probs = model.predict_proba(X_batch)[:, 1]
             for (s_id, t_id), prob in zip(pair_keys, probs):
-                if prob >= threshold:
-                    p70_matches[s_id].append(t_id)
+                if prob >= th:
+                    adaptive_matches[s_id].append(t_id)
+                    c_matches_count += 1
             pairs_to_score.clear()
             pair_keys.clear()
 
-        print(f"[{country}] Completed in {time.time()-t0:.2f}s.")
+        country_stats[country] = {
+            "threshold": th,
+            "retained_matches": c_matches_count,
+            "entities": len(s1_country_recs),
+        }
+        print(f"[{country}] Completed in {time.time()-t0:.2f}s (retained {c_matches_count:,} matches).")
         del target_map, target_ids, raw_names, raw_addrs, s1_country_recs
         gc.collect()
 
-    # Write out matching_results_p70.tsv
+    # Write out matching_results_adaptive.tsv
     print(f"\nWriting {output_matches} in exact test_source1.tsv order...")
     t0 = time.time()
     total_retained_matches = 0
@@ -185,7 +211,7 @@ def rescore_pipeline(
     with open(output_matches, "w", encoding="utf-8") as f_out:
         f_out.write("source1_entity_id\tmatched_entity_ids\n")
         for sid in all_s1_ids:
-            matches = p70_matches.get(sid, [])
+            matches = adaptive_matches.get(sid, [])
             if matches:
                 total_retained_matches += len(matches)
                 retained_entities += 1
@@ -195,10 +221,12 @@ def rescore_pipeline(
 
     print(f"Saved {len(all_s1_ids):,} rows in {time.time()-t0:.2f}s.")
     print("=" * 70)
-    print("RESCORING COMPLETE!")
+    print("COUNTRY-ADAPTIVE RESCORING COMPLETE!")
     print(f"  Total S1 entities: {len(all_s1_ids):,}")
-    print(f"  Matches at threshold 0.50: {total_50_matches:,} across {len(s1_matches):,} entities")
-    print(f"  Matches at threshold {threshold:.2f}: {total_retained_matches:,} across {retained_entities:,} entities")
+    print(f"  Matches at baseline 0.50: {total_50_matches:,} across {len(s1_matches):,} entities")
+    print(f"  Matches at Adaptive Thresholds: {total_retained_matches:,} across {retained_entities:,} entities")
+    for c, st in country_stats.items():
+        print(f"    - {c:8s} (T={st['threshold']:.2f}): {st['retained_matches']:,} matches")
     print(f"  Borderline noisy matches pruned: {total_50_matches - total_retained_matches:,}")
     print(f"  Execution time: {time.time()-t_start:.2f}s")
     print(f"  Output saved to: {output_matches}")
@@ -206,9 +234,18 @@ def rescore_pipeline(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fast threshold rescorer.")
-    parser.add_argument("--threshold", type=float, default=0.70, help="New threshold (e.g. 0.70)")
-    parser.add_argument("--output", default="output/matching_results_p70.tsv", help="Output TSV path")
+    parser = argparse.ArgumentParser(description="Country-adaptive threshold rescorer.")
+    parser.add_argument("--us", type=float, default=0.60, help="US threshold (default: 0.60)")
+    parser.add_argument("--india", type=float, default=0.50, help="India threshold (default: 0.50)")
+    parser.add_argument("--france", type=float, default=0.58, help="France threshold (default: 0.58)")
+    parser.add_argument("--default-th", type=float, default=0.55, help="Default threshold (default: 0.55)")
+    parser.add_argument("--output", default="output/matching_results_adaptive.tsv", help="Output TSV path")
     args = parser.parse_args()
 
-    rescore_pipeline(threshold=args.threshold, output_matches=args.output)
+    rescore_pipeline(
+        threshold_us=args.us,
+        threshold_india=args.india,
+        threshold_france=args.france,
+        threshold_default=args.default_th,
+        output_matches=args.output,
+    )
