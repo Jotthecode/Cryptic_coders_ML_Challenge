@@ -1,12 +1,14 @@
 """
 ML Challenge 2026 - Business Entity Resolution
 Production inference script generating candidate_pairs.tsv and matching_results.tsv.
-Processes test datasets country-by-country in chunks to guarantee:
-  1. Low RAM footprint (< 1.5 GB peak at all times)
-  2. Blazing execution speed across 11.7M records
-  3. Seamless open-set country support (France, US, India, etc.)
-  4. Mathematical guarantee: matched_entity_ids is a strict subset of candidate_entity_ids
-  5. Exact row-for-row alignment with test_source1.tsv
+Key Upgrades:
+  1. High-Recall Composite-Key Blocker (max_candidates = 20)
+  2. 20 RapidFuzz + Address Structure Features
+  3. Strict 1-to-1 Target Uniqueness (Greedy Maximum-Weight Bipartite Assignment)
+  4. Singleton Margin Gating (Recovers valid non-singletons while protecting true singletons)
+  5. Low RAM footprint (< 1.5 GB peak)
+  6. Strict Candidate Subset Constraint
+  7. Exact row-for-row alignment with test_source1.tsv
 """
 
 import argparse
@@ -21,7 +23,7 @@ import polars as pl
 from tqdm import tqdm
 
 from blocking import FastCountryBlocker
-from train_matching import extract_pair_features
+from train_matching import FEATURE_NAMES, extract_pair_features
 from utils import clean_address, clean_domain, clean_text, extract_address_numbers, normalize_country
 
 
@@ -69,11 +71,12 @@ def run_country_inference(
     model,
     threshold: float,
     results_map: Dict[str, Tuple[str, str]],
-    batch_size: int = 5000,
-    max_candidates: int = 12,
+    batch_size: int = 50000,
+    max_candidates: int = 20,
+    singleton_gate_p: float = 0.28,
 ):
     """
-    Run blocking and matching for all S1 entities in a single country partition.
+    Run high-recall blocking, scoring, competitive 1-to-1 assignment, and singleton gating.
     Populates results_map[s1_id] = (cand_str, match_str).
     """
     country_upper = country.strip().upper()
@@ -96,11 +99,11 @@ def run_country_inference(
     gc.collect()
     print(f"[{country_upper}] Loaded {N_targets:,} targets in {time.time()-t0:.2f}s.")
 
-    # Build lean inverted index
+    # Build composite inverted index
     t0 = time.time()
     blocker = FastCountryBlocker(max_candidates=max_candidates)
     blocker.fit_targets(target_ids, raw_names, raw_addrs)
-    print(f"[{country_upper}] Inverted index built in {time.time()-t0:.2f}s.")
+    print(f"[{country_upper}] Composite index built in {time.time()-t0:.2f}s with {len(blocker.token_index):,} tokens.")
 
     total_s1 = len(s1_df)
     print(f"[{country_upper}] Scoring {total_s1:,} S1 entities in batches of {batch_size}...")
@@ -110,12 +113,15 @@ def run_country_inference(
     s1_names = s1_df["business_name"].to_list()
     s1_addrs = s1_df["business_address"].to_list()
 
+    all_cands_map: Dict[str, List[str]] = {}
+    candidate_pairs_pool: List[Tuple[float, str, str]] = []  # (prob, s1_id, target_id)
+    s1_top_candidate: Dict[str, Tuple[str, float]] = {}      # s1_id -> (top_tid, top_prob)
+
     for start_idx in tqdm(range(0, total_s1, batch_size), desc=f"Processing {country_upper}"):
         end_idx = min(start_idx + batch_size, total_s1)
 
         batch_features = []
         batch_pair_keys = []
-        batch_candidates = {}
 
         for i in range(start_idx, end_idx):
             s1_id = s1_ids[i]
@@ -129,7 +135,7 @@ def run_country_inference(
 
             cands = blocker.query_entity(s1_n, s1_a, max_candidates=max_candidates)
             cand_id_list = [target_ids[tidx] for tidx, _, _ in cands]
-            batch_candidates[s1_id] = cand_id_list
+            all_cands_map[s1_id] = cand_id_list
 
             for tidx, b_score, b_rank in cands:
                 tid = target_ids[tidx]
@@ -153,31 +159,64 @@ def run_country_inference(
                 batch_pair_keys.append((s1_id, tid))
 
         # Model inference on batch
-        matched_map = defaultdict(list)
         if batch_features and model is not None:
             X_batch = np.array(batch_features, dtype=np.float32)
             probs = model.predict_proba(X_batch)[:, 1]
 
-            for (s1_id, tid), prob in zip(batch_pair_keys, probs):
-                if prob >= threshold:
-                    matched_map[s1_id].append(tid)
+            for (sid, tid), prob in zip(batch_pair_keys, probs):
+                p = float(prob)
+                # Track top candidate per S1 entity
+                if sid not in s1_top_candidate or p > s1_top_candidate[sid][1]:
+                    s1_top_candidate[sid] = (tid, p)
 
-        # Store results for this batch
-        for i in range(start_idx, end_idx):
-            s1_id = s1_ids[i]
-            cands = batch_candidates.get(s1_id, [])
-            matches = matched_map.get(s1_id, [])
+                # Keep candidates above probability threshold
+                if p >= threshold:
+                    candidate_pairs_pool.append((p, sid, tid))
 
-            cand_str = ",".join(cands) if cands else ""
-            match_str = ",".join(matches) if matches else ""
+    print(f"[{country_upper}] Scored {total_s1:,} entities in {time.time()-t0:.2f}s.")
+    print(f"[{country_upper}] Total candidate match predictions before 1-to-1 assignment: {len(candidate_pairs_pool):,}")
 
-            results_map[s1_id] = (cand_str, match_str)
+    # 1-to-1 Competitive Assignment (Greedy Maximum-Weight Matching)
+    # A target record can match at most ONE S1 entity in ground truth
+    candidate_pairs_pool.sort(key=lambda x: x[0], reverse=True)
+    assigned_targets: Set[str] = set()
+    s1_assigned_matches: Dict[str, List[str]] = defaultdict(list)
 
-    print(f"[{country_upper}] Completed {total_s1:,} entities in {time.time()-t0:.2f}s.")
+    for p, sid, tid in candidate_pairs_pool:
+        if tid not in assigned_targets:
+            assigned_targets.add(tid)
+            s1_assigned_matches[sid].append(tid)
+
+    # Singleton Gating: for entities with 0 matches, recover high-confidence top candidate
+    singleton_recovers = 0
+    for sid in s1_ids:
+        if not s1_assigned_matches.get(sid):
+            if sid in s1_top_candidate:
+                top_tid, top_p = s1_top_candidate[sid]
+                if top_p >= singleton_gate_p and top_tid not in assigned_targets:
+                    assigned_targets.add(top_tid)
+                    s1_assigned_matches[sid].append(top_tid)
+                    singleton_recovers += 1
+
+    print(f"[{country_upper}] 1-to-1 assignment completed. Recovered {singleton_recovers:,} borderline non-singletons.")
+    total_matched_s1 = sum(1 for sid in s1_ids if s1_assigned_matches.get(sid))
+    total_matches = sum(len(m) for m in s1_assigned_matches.values())
+    print(f"[{country_upper}] S1 entities with matches: {total_matched_s1:,} / {total_s1:,} ({total_matched_s1/total_s1:.2%}).")
+    print(f"[{country_upper}] Total matches retained: {total_matches:,}.")
+
+    # Store results
+    for sid in s1_ids:
+        cands = all_cands_map.get(sid, [])
+        matches = s1_assigned_matches.get(sid, [])
+
+        cand_str = ",".join(cands) if cands else ""
+        match_str = ",".join(matches) if matches else ""
+
+        results_map[sid] = (cand_str, match_str)
 
     # Free memory before next country
-    del blocker, target_ids, raw_names, raw_addrs
-    del s1_ids, s1_names, s1_addrs
+    del blocker, target_ids, raw_names, raw_addrs, all_cands_map, candidate_pairs_pool
+    del s1_ids, s1_names, s1_addrs, s1_assigned_matches, assigned_targets, s1_top_candidate
     gc.collect()
 
 
@@ -195,7 +234,7 @@ def predict_pipeline(
     match_file_path = os.path.join(output_dir, "matching_results.tsv")
 
     print("=" * 70)
-    print("       ML CHALLENGE 2026: INFERENCE PIPELINE")
+    print("       ML CHALLENGE 2026: UPGRADED INFERENCE PIPELINE")
     print("=" * 70)
     print(f"Test Directory    : {test_dir}")
     print(f"Output Directory  : {output_dir}")
@@ -203,14 +242,14 @@ def predict_pipeline(
 
     # Load trained model and threshold
     model = None
-    default_th = 0.50
+    default_th = 0.45
     if os.path.exists(model_path):
         print(f"Loading trained matching model from: {model_path}")
         with open(model_path, "rb") as f:
             payload = pickle.load(f)
             if isinstance(payload, dict) and "model" in payload:
                 model = payload["model"]
-                default_th = payload.get("threshold", 0.50)
+                default_th = payload.get("threshold", 0.45)
                 print(f"Loaded model with tuned optimal threshold: {default_th:.2f}")
             else:
                 model = payload
@@ -253,47 +292,50 @@ def predict_pipeline(
             model=model,
             threshold=final_threshold,
             results_map=results_map,
-            batch_size=5000,
-            max_candidates=12,
+            batch_size=50000,
+            max_candidates=20,
         )
 
-    # Write out results preserving exact order of S1 records
-    print(f"\nWriting submission files in exact test_source1 order...")
-    t0 = time.time()
+    # Write out deliverables in exact test_source1.tsv ordering
+    print("\nWriting out final submission TSVs in exact test_source1 order...")
     all_s1_ids = s1_df_all["entity_id"].to_list()
 
-    with open(cand_file_path, "w", encoding="utf-8") as f_cand, open(match_file_path, "w", encoding="utf-8") as f_match:
+    t0 = time.time()
+    with open(cand_file_path, "w", encoding="utf-8") as f_cand:
         f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
+        for sid in all_s1_ids:
+            cands, _ = results_map.get(sid, ("", ""))
+            f_cand.write(f"{sid}\t{cands}\n")
+    print(f"Saved {cand_file_path} in {time.time()-t0:.2f}s.")
+
+    t0 = time.time()
+    with open(match_file_path, "w", encoding="utf-8") as f_match:
         f_match.write("source1_entity_id\tmatched_entity_ids\n")
+        for sid in all_s1_ids:
+            _, matches = results_map.get(sid, ("", ""))
+            f_match.write(f"{sid}\t{matches}\n")
+    print(f"Saved {match_file_path} in {time.time()-t0:.2f}s.")
 
-        for s1_id in all_s1_ids:
-            cand_str, match_str = results_map.get(s1_id, ("", ""))
-            f_cand.write(f"{s1_id}\t{cand_str}\n")
-            f_match.write(f"{s1_id}\t{match_str}\n")
-
-    print(f"Saved {len(all_s1_ids):,} rows to disk in {time.time()-t0:.2f}s.")
     print("=" * 70)
-    print("INFERENCE COMPLETE!")
-    print(f"  - Candidate pairs saved to: {cand_file_path}")
-    print(f"  - Matching results saved to: {match_file_path}")
+    print("UPGRADED INFERENCE PIPELINE COMPLETE!")
+    print(f"Candidate pairs saved to : {cand_file_path}")
+    print(f"Matching results saved to: {match_file_path}")
     print("=" * 70)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run entity resolution inference.")
-    parser.add_argument("--test-dir", default="dataset/test", help="Path to test dataset directory")
-    parser.add_argument("--output-dir", default="output", help="Path to output directory")
-    parser.add_argument("--model-path", default="models/matching_model.pkl", help="Path to trained model")
-    parser.add_argument("--cache-dir", default="tmp_cache", help="Path to target cache directory")
-    parser.add_argument("--threshold", type=float, default=None, help="Probability threshold override")
-    parser.add_argument("--sample", type=int, default=None, help="Sample size for test runs")
+    parser = argparse.ArgumentParser(description="Test Set Inference Pipeline.")
+    parser.add_argument("--test-dir", default="dataset/test", help="Test directory path")
+    parser.add_argument("--output-dir", default="output", help="Output directory path")
+    parser.add_argument("--model-path", default="models/matching_model.pkl", help="Model path")
+    parser.add_argument("--threshold", type=float, default=None, help="Custom probability threshold")
+    parser.add_argument("--sample-size", type=int, default=None, help="Run on small sample for testing")
     args = parser.parse_args()
 
     predict_pipeline(
         test_dir=args.test_dir,
         output_dir=args.output_dir,
         model_path=args.model_path,
-        cache_dir=args.cache_dir,
         threshold=args.threshold,
-        sample_size=args.sample,
+        sample_size=args.sample_size,
     )

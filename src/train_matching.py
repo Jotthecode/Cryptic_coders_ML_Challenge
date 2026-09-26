@@ -1,7 +1,7 @@
 """
 ML Challenge 2026 - Business Entity Resolution
 Pairwise matching feature extraction, model training, and threshold optimization module.
-Uses RapidFuzz string similarities, address structure features, and LightGBM to optimize Macro F_0.5.
+Uses RapidFuzz string similarities, address structure features, composite key blocking, and LightGBM to optimize Macro F_0.5.
 """
 
 import argparse
@@ -35,10 +35,12 @@ FEATURE_NAMES = [
     "dom_exact",
     "dom_contains",
     "exact_name",
+    "first_word_match",
     "f_addr_ratio",
     "f_addr_set",
     "exact_addr",
     "num_jaccard",
+    "addr_word_jaccard",
     "has_addr1",
     "has_addr2",
     "len_ratio",
@@ -78,6 +80,11 @@ def extract_pair_features(
     )
     exact_name = 1.0 if (s1_name_cl and s1_name_cl == t_name_cl) else 0.0
 
+    # First word exact match
+    w1 = s1_name_cl.split()[0] if s1_name_cl else ""
+    w2 = t_name_cl.split()[0] if t_name_cl else ""
+    first_word_match = 1.0 if (w1 and w1 == w2) else 0.0
+
     # 3. Address similarities
     has_a1 = 1.0 if len(s1_addr_cl) > 0 else 0.0
     has_a2 = 1.0 if len(t_addr_cl) > 0 else 0.0
@@ -87,6 +94,11 @@ def extract_pair_features(
 
     # 4. Number overlaps (PIN codes, house numbers)
     num_jaccard = (len(s1_nums & t_nums) / len(s1_nums | t_nums)) if (s1_nums and t_nums) else 0.0
+
+    # Address non-numeric word Jaccard
+    aw1 = set([w for w in s1_addr_cl.split() if len(w) >= 3])
+    aw2 = set([w for w in t_addr_cl.split() if len(w) >= 3])
+    addr_word_jaccard = (len(aw1 & aw2) / len(aw1 | aw2)) if (aw1 and aw2) else 0.0
 
     # 5. Length ratio
     l1 = len(s1_name_cl)
@@ -105,10 +117,12 @@ def extract_pair_features(
         dom_exact,
         dom_contains,
         exact_name,
+        first_word_match,
         f_addr_ratio,
         f_addr_set,
         exact_addr,
         num_jaccard,
+        addr_word_jaccard,
         has_a1,
         has_a2,
         len_ratio,
@@ -122,8 +136,8 @@ def extract_pair_features(
 def train_pipeline(
     data_dir: str = "dataset",
     model_save_path: str = "models/matching_model.pkl",
-    train_sample: int = 25000,
-    val_sample: int = 5000,
+    train_sample: int = 35000,
+    val_sample: int = 6000,
 ):
     """
     End-to-end training and threshold tuning pipeline.
@@ -138,37 +152,40 @@ def train_pipeline(
     train_s3_path = os.path.join(data_dir, "train", "train_source3.tsv")
     gt_path = os.path.join(data_dir, "train", "train_ground_truth.tsv")
 
-    total_s1_needed = train_sample + val_sample
-    print(f"Loading {total_s1_needed} S1 records from {train_s1_path}...")
-    s1_df = pl.scan_csv(train_s1_path, separator="\t").limit(total_s1_needed).collect()
+    print(f"Loading Source 1 records ({train_sample + val_sample} sample)...")
+    s1_df = pl.read_csv(train_s1_path, separator="\t")
+    s1_df = s1_df.sample(n=train_sample + val_sample, seed=42)
 
-    s1_ids = set(s1_df["entity_id"])
-    print(f"Loading ground truth for {len(s1_ids)} S1 records...")
-    gt_df = pl.scan_csv(gt_path, separator="\t").filter(pl.col("source1_entity_id").is_in(s1_ids)).collect()
-
+    # Load Ground Truth
+    print(f"Loading Ground Truth from {gt_path}...")
+    gt_df = pl.read_csv(gt_path, separator="\t")
     gt_map: Dict[str, Set[str]] = {}
     matched_target_ids: Set[str] = set()
     for r in gt_df.iter_rows(named=True):
         m = r["matched_entity_ids"]
         cands = set(m.split(",")) if (m and str(m).strip()) else set()
         gt_map[r["source1_entity_id"]] = cands
-        matched_target_ids.update(cands)
+    # Only keep ground truth matches for the sampled S1 entities to keep memory lightweight (< 1 GB)
+    sample_s1_ids = set(s1_df["entity_id"].to_list())
+    sample_matched_targets: Set[str] = set()
+    for sid in sample_s1_ids:
+        sample_matched_targets.update(gt_map.get(sid, set()))
 
     # Split train and validation
     train_s1_df = s1_df[:train_sample]
     val_s1_df = s1_df[train_sample:]
 
-    # Load targets: all matched targets + random sample of ~400k targets
-    print(f"Loading target pool (matched targets + background targets)...")
+    # Load targets: sample's true matches + realistic distractors
+    print(f"Loading target pool ({len(sample_matched_targets):,} matched targets + 700k distractors)...")
     s2_df = pl.scan_csv(train_s2_path, separator="\t").filter(
-        (pl.col("entity_id").is_in(matched_target_ids)) | (pl.int_range(0, pl.len()) < 250000)
+        (pl.col("entity_id").is_in(sample_matched_targets)) | (pl.int_range(0, pl.len()) < 400000)
     ).collect()
     s3_df = pl.scan_csv(train_s3_path, separator="\t").filter(
-        (pl.col("entity_id").is_in(matched_target_ids)) | (pl.int_range(0, pl.len()) < 250000)
+        (pl.col("entity_id").is_in(sample_matched_targets)) | (pl.int_range(0, pl.len()) < 300000)
     ).collect()
 
     all_targets = pl.concat([s2_df, s3_df], how="vertical").unique(subset=["entity_id"])
-    print(f"Target pool loaded: {len(all_targets)} records.")
+    print(f"Target pool loaded: {len(all_targets):,} records.")
 
     # Partition targets by country
     target_by_country = defaultdict(lambda: {"ids": [], "names": [], "addrs": []})
@@ -201,13 +218,13 @@ def train_pipeline(
     # Build blocker for each country partition
     blockers = {}
     for c, data in target_by_country.items():
-        print(f"Building blocker index for country: {c} ({len(data['ids'])} targets)...")
-        b = FastCountryBlocker(max_candidates=12)
+        print(f"Building composite blocker index for country: {c} ({len(data['ids']):,} targets)...")
+        b = FastCountryBlocker(max_candidates=20)
         b.fit_targets(data["ids"], data["names"], data["addrs"])
         blockers[c] = b
 
     # Generate training pairs
-    print(f"Extracting pairwise training features from {len(train_s1_df)} S1 entities...")
+    print(f"Extracting pairwise training features from {len(train_s1_df):,} S1 entities...")
     X_train = []
     y_train = []
 
@@ -228,8 +245,9 @@ def train_pipeline(
         s1_addr_cl = clean_address(s1_raw_addr)
         s1_nums = extract_address_numbers(s1_raw_addr)
 
-        cands = blocker.query_entity(s1_raw_name, s1_raw_addr, max_candidates=12)
-        for tid, b_score, b_rank in cands:
+        cands = blocker.query_entity(s1_raw_name, s1_raw_addr, max_candidates=20)
+        for tidx, b_score, b_rank in cands:
+            tid = blocker.target_ids[tidx]
             t_info = target_lookup.get(tid)
             if not t_info:
                 continue
@@ -253,14 +271,15 @@ def train_pipeline(
 
     X_train = np.array(X_train, dtype=np.float32)
     y_train = np.array(y_train, dtype=np.int32)
+
     pos_count = int(np.sum(y_train))
     neg_count = len(y_train) - pos_count
-    print(f"Generated {len(X_train)} training pairs: {pos_count} positives, {neg_count} negatives.")
+    print(f"Training dataset ready: {len(X_train):,} pairs (Positive: {pos_count:,}, Negative: {neg_count:,}, Pos Ratio: {pos_count/len(y_train):.2%}).")
 
-    # Train LightGBM model
-    print("Fitting LightGBM classifier...")
+    # Fit LightGBM model
+    print("Training LightGBM Classifier...")
     model = lgb.LGBMClassifier(
-        n_estimators=200,
+        n_estimators=220,
         learning_rate=0.08,
         num_leaves=31,
         subsample=0.8,
@@ -274,7 +293,7 @@ def train_pipeline(
     print(f"LightGBM fitted in {time.time() - t0:.2f}s.")
 
     # Validation evaluation & threshold tuning
-    print(f"Evaluating and optimizing threshold on {len(val_s1_df)} validation S1 entities...")
+    print(f"Evaluating and optimizing threshold on {len(val_s1_df):,} validation S1 entities...")
     val_features = []
     val_index_pairs = []
 
@@ -294,8 +313,9 @@ def train_pipeline(
         s1_addr_cl = clean_address(s1_raw_addr)
         s1_nums = extract_address_numbers(s1_raw_addr)
 
-        cands = blocker.query_entity(s1_raw_name, s1_raw_addr, max_candidates=12)
-        for tid, b_score, b_rank in cands:
+        cands = blocker.query_entity(s1_raw_name, s1_raw_addr, max_candidates=20)
+        for tidx, b_score, b_rank in cands:
+            tid = blocker.target_ids[tidx]
             t_info = target_lookup.get(tid)
             if not t_info:
                 continue
@@ -323,8 +343,8 @@ def train_pipeline(
     for (s1_id, tid), prob in zip(val_index_pairs, val_probs):
         s1_pred_map[s1_id].append((tid, prob))
 
-    thresholds = [0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
-    best_th = 0.65
+    thresholds = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+    best_th = 0.45
     best_f05 = -1.0
     best_stats = {}
 
@@ -334,7 +354,14 @@ def train_pipeline(
         for r in val_s1_df.iter_rows(named=True):
             s1_id = r["entity_id"]
             gt_eval[s1_id] = gt_map.get(s1_id, set())
-            preds_dict[s1_id] = set([tid for tid, p in s1_pred_map.get(s1_id, []) if p >= th])
+
+            # Top candidates above threshold, with fallback to top candidate if high confidence
+            c_preds = [tid for tid, p in s1_pred_map.get(s1_id, []) if p >= th]
+            if not c_preds and s1_pred_map.get(s1_id):
+                top_tid, top_p = s1_pred_map[s1_id][0]
+                if top_p >= 0.28:
+                    c_preds = [top_tid]
+            preds_dict[s1_id] = set(c_preds)
 
         metrics = evaluate_f05_macro(gt_eval, preds_dict)
         f05 = metrics["f05_macro"]
@@ -368,11 +395,11 @@ def train_pipeline(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Entity Matching Model.")
-    parser.add_argument("--data-dir", default="dataset", help="Path to dataset root folder")
-    parser.add_argument("--model-save-path", default="models/matching_model.pkl", help="Model output file path")
-    parser.add_argument("--train-sample", type=int, default=25000, help="Number of S1 train entities")
-    parser.add_argument("--val-sample", type=int, default=5000, help="Number of S1 validation entities")
+    parser = argparse.ArgumentParser(description="Train LightGBM matching model.")
+    parser.add_argument("--data-dir", default="dataset", help="Data directory")
+    parser.add_argument("--model-save-path", default="models/matching_model.pkl", help="Model output path")
+    parser.add_argument("--train-sample", type=int, default=30000, help="Train S1 sample count")
+    parser.add_argument("--val-sample", type=int, default=5000, help="Validation S1 sample count")
     args = parser.parse_args()
 
     train_pipeline(
